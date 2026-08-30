@@ -1,0 +1,10 @@
+{
+	"admin/network/wifi_import": {
+		"title": "Импорт Wi-Fi",
+		"action": {
+			"type": "view",
+			"path": "wifi_import"
+		},
+		"order": 60
+	}
+}
