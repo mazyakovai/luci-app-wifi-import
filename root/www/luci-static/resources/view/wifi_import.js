@@ -1,10 +1,35 @@
 'use strict';
 
+/**
+ * Экранирует HTML-сущности для безопасного вывода пользовательского текста в DOM.
+ * Предотвращает XSS при рендере строк в outputLog и уведомлениях.
+ */
+function escapeHtml(str) {
+	if (typeof str !== 'string') return String(str);
+	return str
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#039;');
+}
+
 return L.view.extend({
 	handleUpload: function(ev) {
 		var csvDataInput = document.getElementById('csv_data');
 		if (!csvDataInput || !csvDataInput.value.trim()) {
 			L.ui.addNotification(null, E('p', 'Ошибка: Вставьте список MAC-адресов (MAC и SSID) в текстовое поле!'), 'danger');
+			return;
+		}
+
+		var csvRaw = csvDataInput.value.trim();
+		if (csvRaw.length > 50000) {
+			L.ui.addNotification(null, E('p', 'Ошибка: Объём данных слишком велик (макс. 50 000 символов)!'), 'danger');
+			return;
+		}
+		var lines = csvRaw.split(/\r?\n/);
+		if (lines.length > 100) {
+			L.ui.addNotification(null, E('p', 'Ошибка: Слишком много строк (макс. 100 сетей за один импорт)!'), 'danger');
 			return;
 		}
 
@@ -15,19 +40,22 @@ return L.view.extend({
 		var clearFlag = document.getElementById('clear_old').checked ? '1' : '0';
 		var bandMode = document.getElementById('band_mode').value || 'both';
 		
-		var lines = csvDataInput.value.split(/\r?\n/);
 		var outputLog = [];
 		outputLog.push("[*] Запуск импорта сетей напрямую через LuCI UCI API...");
 
 		L.ui.showModal(L.sidebar ? 'Загрузка...' : null, E('p', { 'class': 'spinning' }, 'Применение конфигурации сетей...'));
 
 		L.uci.load('wireless').then(function() {
+			var sectionPrefix = 'imp_';
+			var batchId = Date.now();
 			
 			if (clearFlag === '1') {
-				outputLog.push("[*] Очистка старых виртуальных интерфейсов Wi-Fi...");
+				outputLog.push("[*] Безопасная очистка только ранее импортированных сетей...");
 				var sections = L.uci.sections('wireless', 'wifi-iface');
 				for (var s = 0; s < sections.length; s++) {
-					L.uci.remove('wireless', sections[s]['.name']);
+					if (sections[s]['.name'] && sections[s]['.name'].indexOf(sectionPrefix) === 0) {
+						L.uci.remove('wireless', sections[s]['.name']);
+					}
 				}
 			}
 
@@ -39,15 +67,24 @@ return L.view.extend({
 
 				var chunks = line.split(',');
 				if (chunks.length < 2) {
-					outputLog.push("[!] Пропущена некорректная строка #" + (i + 1) + ": " + line);
+					outputLog.push("[!] Пропущена некорректная строка #" + (i + 1) + ": " + escapeHtml(line));
 					continue;
 				}
 
-				var mac = chunks[0].trim().replace(/[\r\n\s]/g, '').toLowerCase();
-				var ssid = chunks[1].replace(/[\r\n]/g, '').trim();
+				var mac = chunks[0] ? chunks[0].trim().replace(/[\r\n\s]/g, '').toLowerCase() : '';
+				var ssid = chunks[1] ? chunks[1].replace(/[\r\n\t]/g, '').trim() : '';
+				ssid = ssid.replace(/[\"'\\;\|$\`#=&]/g, '');
+
+				if (ssid.length > 32) {
+					ssid = ssid.substring(0, 32);
+				}
+				if (!ssid) {
+					outputLog.push("[!] Пропущена строка #" + (i + 1) + ": пустой SSID после санитайза");
+					continue;
+				}	
 
 				if (!/^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/.test(mac)) {
-					outputLog.push("Ошибка строки #" + (i + 1) + ": Неверный формат MAC -> " + mac);
+					outputLog.push("Ошибка строки #" + (i + 1) + ": Неверный формат MAC -> " + escapeHtml(mac));
 					continue;
 				}
 
@@ -59,9 +96,9 @@ return L.view.extend({
 				if (bandMode === '5g' && !is5G) continue;
 
 				count++;
-				outputLog.push("Нарезка точки #" + count + " -> [" + freqTag + "] MAC: " + mac + " | SSID: '" + ssid + "'");
+				outputLog.push("Нарезка точки #" + count + " -> [" + freqTag + "] MAC: " + escapeHtml(mac) + " | SSID: '" + escapeHtml(ssid) + "'");
 
-				var uniqueSectionId = 'imp_' + Date.now() + '_' + Math.floor(Math.random() * 1000) + '_' + count;
+				var uniqueSectionId = sectionPrefix + batchId + '_' + i + '_' + count;
 				var sectionName = L.uci.add('wireless', 'wifi-iface', uniqueSectionId);
 				
 				L.uci.set('wireless', sectionName, 'device', targetRadio);
@@ -102,7 +139,7 @@ return L.view.extend({
 		}).catch(function(err) {
 			L.ui.hideModal();
 			ev.target.disabled = false;
-			L.ui.addNotification(null, E('p', 'Системная ошибка: ' + err.message), 'danger');
+			L.ui.addNotification(null, E('p', 'Системная ошибка: ' + escapeHtml(err.message)), 'danger');
 		});
 	},
 
@@ -120,7 +157,7 @@ return L.view.extend({
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title', 'for': 'clear_old' }, 'Режим полной перезаписи (удалить прошлые сети):'),
+						E('label', { 'class': 'cbi-value-title', 'for': 'clear_old' }, 'Очистить предыдущий импорт (не затронет личные сети):'),
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', { 'type': 'checkbox', 'id': 'clear_old', 'checked': true })
 						])
